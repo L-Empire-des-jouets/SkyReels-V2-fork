@@ -444,11 +444,17 @@ class T5EncoderModel(ModelMixin):
         self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=text_len, clean="whitespace")
 
     def encode(self, texts):
+        # 1) Tokenisation + envoi sur le bon device
         ids, mask = self.tokenizer(texts, return_mask=True, add_special_tokens=True)
-        ids = ids.to(self.device)
+        ids  = ids.to(self.device)
         mask = mask.to(self.device)
-        # seq_lens = mask.gt(0).sum(dim=1).long()
+
+        # 2) Forward dans le T5
         context = self.model(ids, mask)
-        context = context * mask.unsqueeze(-1).cuda()
+
+        # 3) Aligne le masque sur le même device que le context (CPU ou GPU)
+        mask = mask.to(context.device)
+        context = context * mask.unsqueeze(-1)
 
         return context
+

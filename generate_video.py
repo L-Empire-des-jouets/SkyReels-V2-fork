@@ -1,38 +1,44 @@
-import argparse
-import gc
 import os
-import random
-import time
-
-import imageio
 import torch
-from diffusers.utils import load_image
+import deepspeed
 
-from skyreels_v2_infer.modules import download_model
-from skyreels_v2_infer.pipelines import Image2VideoPipeline
-from skyreels_v2_infer.pipelines import PromptEnhancer
-from skyreels_v2_infer.pipelines import resizecrop
-from skyreels_v2_infer.pipelines import Text2VideoPipeline
+# Active un logging plus verbeux pour NCCL (optionnel, diagnostic)
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
 
-MODEL_ID_CONFIG = {
-    "text2video": [
-        "Skywork/SkyReels-V2-T2V-14B-540P",
-        "Skywork/SkyReels-V2-T2V-14B-720P",
-    ],
-    "image2video": [
-        "Skywork/SkyReels-V2-I2V-1.3B-540P",
-        "Skywork/SkyReels-V2-I2V-14B-540P",
-        "Skywork/SkyReels-V2-I2V-14B-720P",
-    ],
-}
-
+# Configuration pour optimiser l'utilisation mémoire
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 if __name__ == "__main__":
+    # ——————— Pinning et init du groupe distribué NCCL ———————
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    deepspeed.init_distributed(dist_backend="gloo")
+    # ——————————————————————————————————————————————————————
+
+    import argparse
+    import gc
+    import random
+    import time
+    import imageio
+    from diffusers.utils import load_image
+
+    from skyreels_v2_infer.modules import download_model
+    from skyreels_v2_infer.pipelines import (
+        Text2VideoPipeline,
+        Image2VideoPipeline,
+        PromptEnhancer,
+        resizecrop,
+    )
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", type=str, default="video_out")
-    parser.add_argument("--model_id", type=str, default="Skywork/SkyReels-V2-T2V-14B-540P")
-    parser.add_argument("--resolution", type=str, choices=["540P", "720P"])
+    parser.add_argument(
+        "--model_id",
+        type=str,
+        default="Skywork/SkyReels-V2-T2V-14B-540P",
+    )
+    parser.add_argument("--resolution", type=str, choices=["540P", "720P"], required=True)
     parser.add_argument("--num_frames", type=int, default=97)
     parser.add_argument("--image", type=str, default=None)
     parser.add_argument("--guidance_scale", type=float, default=6.0)
@@ -45,7 +51,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt",
         type=str,
-        default="A serene lake surrounded by towering mountains, with a few swans gracefully gliding across the water and sunlight dancing on the surface.",
+        default=(
+            "A serene lake surrounded by towering mountains, with a few swans "
+            "gracefully gliding across the water and sunlight dancing on the surface."
+        ),
     )
     parser.add_argument("--prompt_enhancer", action="store_true")
     parser.add_argument("--teacache", action="store_true")
@@ -53,85 +62,191 @@ if __name__ == "__main__":
         "--teacache_thresh",
         type=float,
         default=0.2,
-        help="Higher speedup will cause to worse quality -- 0.1 for 2.0x speedup -- 0.2 for 3.0x speedup")
+        help="Higher speedup with cache at cost of some quality (0.1=2x,0.2=3x)",
+    )
     parser.add_argument(
         "--use_ret_steps",
         action="store_true",
-        help="Using Retention Steps will result in faster generation speed and better generation quality.")
+        help="Enable retention steps for faster generation and better quality",
+    )
+    # Nouveaux arguments pour l'optimisation mémoire
+    parser.add_argument("--cpu_offload_aggressive", action="store_true", help="Aggressive CPU offloading")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
+    parser.add_argument("--sequential_cpu_offload", action="store_true", help="Enable sequential CPU offload")
+    
     args = parser.parse_args()
 
+    # Download ou validation du modèle
     args.model_id = download_model(args.model_id)
     print("model_id:", args.model_id)
 
-    assert (args.use_usp and args.seed is not None) or (not args.use_usp), "usp mode need seed"
+    # Gestion du seed
+    assert (not args.use_usp) or (args.use_usp and args.seed is not None), \
+        "--use_usp requires --seed"
     if args.seed is None:
         random.seed(time.time())
-        args.seed = int(random.randrange(4294967294))
+        args.seed = random.randrange(2**32 - 1)
 
+    # Configuration résolution
     if args.resolution == "540P":
-        height = 544
-        width = 960
-    elif args.resolution == "720P":
-        height = 720
-        width = 1280
+        height, width = 544, 960
     else:
-        raise ValueError(f"Invalid resolution: {args.resolution}")
+        height, width = 720, 1280
 
+    # Nettoyage mémoire préventif
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Chargement optionnel d'une image
     image = load_image(args.image).convert("RGB") if args.image else None
-    negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    local_rank = 0
+
+    # Negative prompt
+    negative_prompt = (
+        "Bright tones, overexposed, static, blurred details, subtitles, style, works, "
+        "paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, "
+        "ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, "
+        "disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, "
+        "many people in the background, walking backwards"
+    )
+
+    # Distributed USP setup (optionnel)
     if args.use_usp:
-        assert not args.prompt_enhancer, "`--prompt_enhancer` is not allowed if using `--use_usp`. We recommend running the skyreels_v2_infer/pipelines/prompt_enhancer.py script first to generate enhanced prompt before enabling the `--use_usp` parameter."
         from xfuser.core.distributed import initialize_model_parallel, init_distributed_environment
         import torch.distributed as dist
 
-        dist.init_process_group("nccl")
-        local_rank = dist.get_rank()
-        torch.cuda.set_device(dist.get_rank())
-        device = "cuda"
+        # 1) Init CPU <-> CPU (pour la broadcast du RNG) via Gloo
+        deepspeed.init_distributed(dist_backend="gloo")
 
-        init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
+        # 2) Pinning du process sur la bonne GPU
+        torch.cuda.set_device(local_rank)
 
+        # 3) Récupère le nombre total de ranks
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        # 4) Initialise l'environnement USP (xfuser)
+        init_distributed_environment(rank=local_rank, world_size=world_size)
         initialize_model_parallel(
-            sequence_parallel_degree=dist.get_world_size(),
+            sequence_parallel_degree=world_size,
             ring_degree=1,
-            ulysses_degree=dist.get_world_size(),
+            ulysses_degree=world_size,
         )
 
+    # Prompt enhancer
     prompt_input = args.prompt
-    if args.prompt_enhancer and args.image is None:
-        print(f"init prompt enhancer")
-        prompt_enhancer = PromptEnhancer()
-        prompt_input = prompt_enhancer(prompt_input)
+    if args.prompt_enhancer and image is None:
+        prompt_input = PromptEnhancer()(prompt_input)
         print(f"enhanced prompt: {prompt_input}")
-        del prompt_enhancer
         gc.collect()
         torch.cuda.empty_cache()
 
+    # Initialisation du pipeline avec optimisations mémoire
     if image is None:
-        assert "T2V" in args.model_id, f"check model_id:{args.model_id}"
         print("init text2video pipeline")
         pipe = Text2VideoPipeline(
-            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload
+            model_path=args.model_id,
+            dit_path=args.model_id,
+            use_usp=args.use_usp,
+            offload=args.offload,
         )
-    else:
-        assert "I2V" in args.model_id, f"check model_id:{args.model_id}"
-        print("init img2video pipeline")
-        pipe = Image2VideoPipeline(
-            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload
-        )
-        args.image = load_image(args.image)
-        image_width, image_height = args.image.size
-        if image_height > image_width:
-            height, width = width, height
-        args.image = resizecrop(args.image, height, width)
-
-    if args.teacache:
-        pipe.transformer.initialize_teacache(enable_teacache=True, num_steps=args.inference_steps, 
-                                             teacache_thresh=args.teacache_thresh, use_ret_steps=args.use_ret_steps, 
-                                             ckpt_dir=args.model_id)
+        # Évite de déplacer le text_encoder sur GPU pour économiser de la mémoire
+        def _noop_to(*args, **kwargs):
+            return pipe.text_encoder
+        pipe.text_encoder.to = _noop_to
         
+        # Déplace le text_encoder sur CPU de manière permanente
+        pipe.text_encoder = pipe.text_encoder.to("cpu")
+        
+    else:
+        print("init image2video pipeline")
+        pipe = Image2VideoPipeline(
+            model_path=args.model_id,
+            dit_path=args.model_id,
+            use_usp=args.use_usp,
+            offload=args.offload,
+        )
+        image = resizecrop(image, height, width)
+        # Déplace le text_encoder sur CPU pour I2V aussi
+        pipe.text_encoder = pipe.text_encoder.to("cpu")
 
+    # Optimisations mémoire supplémentaires
+    if args.sequential_cpu_offload:
+        # Offload séquentiel des composants
+        if hasattr(pipe, 'vae'):
+            pipe.vae = pipe.vae.to("cpu")
+        if hasattr(pipe, 'unet'):
+            pipe.unet = pipe.unet.to("cpu")
+        print("Sequential CPU offload enabled")
+
+    if args.gradient_checkpointing:
+        # Active le gradient checkpointing si disponible
+        try:
+            if hasattr(pipe.transformer, 'enable_gradient_checkpointing'):
+                pipe.transformer.enable_gradient_checkpointing()
+                print("Gradient checkpointing enabled")
+            elif hasattr(pipe.transformer, '_set_gradient_checkpointing'):
+                # Pour WanModel, essaie la méthode directe
+                pipe.transformer._set_gradient_checkpointing(True)
+                print("Gradient checkpointing enabled (WanModel)")
+        except Exception as e:
+            print(f"Gradient checkpointing not supported: {e}")
+            print("Continuing without gradient checkpointing")
+
+    # Configuration DeepSpeed pour l'offload
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    # Configuration ZeRO compatible avec init_inference
+    zero_config = {
+        "offload_param": {
+            "device": "cpu",
+            "nvme_path": "offload",
+            "pin_memory": False,
+        }
+    }
+
+    if args.cpu_offload_aggressive:
+        # Configuration plus aggressive pour l'offload
+        zero_config["offload_param"]["pin_memory"] = True
+        print("Aggressive CPU offload enabled")
+
+    # Wrapping the transformer with DeepSpeed Inference Engine
+    engine = deepspeed.init_inference(
+        pipe.transformer,
+        tensor_parallel={"tp_size": world_size},
+        dtype=torch.float16,
+        replace_with_kernel_inject=True,
+        zero=zero_config,
+    )
+    pipe.transformer = engine
+
+    # Nettoyage mémoire après init DeepSpeed
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Teacache (optionnel)
+    if args.teacache:
+        engine.module.initialize_teacache(
+            enable_teacache=True,
+            num_steps=args.inference_steps,
+            teacache_thresh=args.teacache_thresh,
+            use_ret_steps=args.use_ret_steps,
+            ckpt_dir=args.model_id,
+        )
+
+    # Fonction pour déplacer les tenseurs sur GPU temporairement
+    def move_to_gpu_temporarily(model, device):
+        """Déplace le modèle sur GPU temporairement pour l'inférence"""
+        if hasattr(model, 'to'):
+            return model.to(device)
+        return model
+
+    def move_to_cpu_after_use(model):
+        """Remet le modèle sur CPU après utilisation"""
+        if hasattr(model, 'to'):
+            model.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Prépare les kwargs pour l'inférence
     kwargs = {
         "prompt": prompt_input,
         "negative_prompt": negative_prompt,
@@ -143,19 +258,72 @@ if __name__ == "__main__":
         "height": height,
         "width": width,
     }
-
     if image is not None:
-        kwargs["image"] = args.image.convert("RGB")
+        kwargs["image"] = image
 
-    save_dir = os.path.join("result", args.outdir)
-    os.makedirs(save_dir, exist_ok=True)
+    # Répertoire de sortie
+    output_dir = os.path.join("result", args.outdir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    with torch.cuda.amp.autocast(dtype=pipe.transformer.dtype), torch.no_grad():
-        print(f"infer kwargs:{kwargs}")
-        video_frames = pipe(**kwargs)[0]
+    # Monitoring mémoire
+    def print_memory_usage():
+        if torch.cuda.is_available():
+            print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated, "
+                  f"{torch.cuda.memory_reserved() / 1024**3:.2f} GB reserved")
 
+    print("Memory usage before inference:")
+    print_memory_usage()
+
+    # Lancement de l'inférence avec gestion mémoire optimisée
+    try:
+        with torch.cuda.amp.autocast(dtype=torch.float16), torch.no_grad():
+            # Nettoyage préventif
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            print("Starting inference...")
+            video_frames = pipe(**kwargs)[0]
+            
+            print("Memory usage after inference:")
+            print_memory_usage()
+            
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"CUDA OOM Error: {e}")
+        print("Trying with more aggressive memory management...")
+        
+        # Nettoyage complet
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Réduit la taille des frames si nécessaire
+        if args.num_frames > 49:
+            print("Reducing num_frames to 49 for memory efficiency")
+            kwargs["num_frames"] = 49
+            
+        # Réduit les steps d'inférence
+        if args.inference_steps > 20:
+            print("Reducing inference_steps to 20 for memory efficiency")
+            kwargs["num_inference_steps"] = 20
+            
+        # Retry avec paramètres réduits
+        with torch.cuda.amp.autocast(dtype=torch.float16), torch.no_grad():
+            video_frames = pipe(**kwargs)[0]
+
+    # Sauvegarde sur le master
     if local_rank == 0:
-        current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-        video_out_file = f"{args.prompt[:100].replace('/','')}_{args.seed}_{current_time}.mp4"
-        output_path = os.path.join(save_dir, video_out_file)
-        imageio.mimwrite(output_path, video_frames, fps=args.fps, quality=8, output_params=["-loglevel", "error"])
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        safe_prompt = args.prompt[:50].replace('/', '_')
+        filename = f"{safe_prompt}_{args.seed}_{timestamp}.mp4"
+        path = os.path.join(output_dir, filename)
+        imageio.mimwrite(
+            path,
+            video_frames,
+            fps=args.fps,
+            quality=8,
+            output_params=["-loglevel", "error"],
+        )
+        print(f"Video saved to: {path}")
+        
+    # Nettoyage final
+    gc.collect()
+    torch.cuda.empty_cache()

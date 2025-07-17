@@ -83,7 +83,8 @@ class Text2VideoPipeline:
 
         # evaluation mode
         self.transformer.to(self.device)
-        with torch.cuda.amp.autocast(dtype=self.transformer.dtype), torch.no_grad():
+        dtype = getattr(self.transformer, "dtype", torch.float16)
+        with torch.cuda.amp.autocast(dtype=dtype), torch.no_grad():
             self.scheduler.set_timesteps(num_inference_steps, device=self.device, shift=shift)
             timesteps = self.scheduler.timesteps
 
