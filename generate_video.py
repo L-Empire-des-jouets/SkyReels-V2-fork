@@ -148,14 +148,6 @@ if __name__ == "__main__":
             use_usp=args.use_usp,
             offload=args.offload,
         )
-        # Évite de déplacer le text_encoder sur GPU pour économiser de la mémoire
-        def _noop_to(*args, **kwargs):
-            return pipe.text_encoder
-        pipe.text_encoder.to = _noop_to
-        
-        # Déplace le text_encoder sur CPU de manière permanente
-        pipe.text_encoder = pipe.text_encoder.to("cpu")
-        
     else:
         print("init image2video pipeline")
         pipe = Image2VideoPipeline(
@@ -165,16 +157,260 @@ if __name__ == "__main__":
             offload=args.offload,
         )
         image = resizecrop(image, height, width)
-        # Déplace le text_encoder sur CPU pour I2V aussi
-        pipe.text_encoder = pipe.text_encoder.to("cpu")
 
-    # Optimisations mémoire supplémentaires
+    # FIX 1: Gérer le device du VAE de manière cohérente
+    current_device = f"cuda:{local_rank}"
+    
+    # FIX 2: Wrapper VAE CORRIGÉ pour éviter la récursion infinie
+    class VAEWrapper:
+        def __init__(self, original_vae, device):
+            # IMPORTANT: Utiliser object.__setattr__ pour éviter la récursion
+            object.__setattr__(self, '_original_vae', original_vae)
+            object.__setattr__(self, '_device', device)
+            object.__setattr__(self, '_cpu_offload', args.sequential_cpu_offload)
+            object.__setattr__(self, '_is_on_gpu', False)
+            
+            # Détecte si le VAE a une structure imbriquée
+            if hasattr(original_vae, 'vae'):
+                object.__setattr__(self, '_inner_vae', original_vae.vae)
+                object.__setattr__(self, '_has_nested_structure', True)
+            else:
+                object.__setattr__(self, '_inner_vae', original_vae)
+                object.__setattr__(self, '_has_nested_structure', False)
+            
+        @property
+        def vae(self):
+            """Retourne le VAE interne pour préserver la structure vae.vae"""
+            if self._has_nested_structure:
+                return self._inner_vae
+            else:
+                # Pour les VAE sans structure imbriquée, retourne self pour maintenir l'interface
+                return self
+            
+        @vae.setter
+        def vae(self, value):
+            """Setter pour le VAE interne"""
+            object.__setattr__(self, '_inner_vae', value)
+            
+        def _ensure_on_device(self, target_device):
+            """Assure que le VAE est sur le bon device avec gestion mémoire"""
+            if not self._cpu_offload:
+                return
+                
+            current_device = next(self._inner_vae.parameters()).device
+            if str(current_device) != str(target_device):
+                try:
+                    self._inner_vae = self._inner_vae.to(target_device)
+                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+                except torch.cuda.OutOfMemoryError:
+                    # Nettoie la mémoire et réessaie
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    self._inner_vae = self._inner_vae.to(target_device)
+                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+            
+        def _offload_if_needed(self):
+            """Remet sur CPU si l'offload est activé"""
+            if self._cpu_offload and self._is_on_gpu:
+                self._inner_vae = self._inner_vae.to("cpu")
+                object.__setattr__(self, '_is_on_gpu', False)
+                torch.cuda.empty_cache()
+            
+        def encode(self, *args, **kwargs):
+            self._ensure_on_device(self._device)
+            
+            # S'assurer que tous les inputs sont sur le bon device
+            args = [arg.to(self._device) if hasattr(arg, 'to') else arg for arg in args]
+            for k, v in kwargs.items():
+                if hasattr(v, 'to'):
+                    kwargs[k] = v.to(self._device)
+            
+            result = self._inner_vae.encode(*args, **kwargs)
+            self._offload_if_needed()
+            return result
+            
+        def decode(self, *args, **kwargs):
+            self._ensure_on_device(self._device)
+            
+            # S'assurer que tous les inputs sont sur le bon device
+            args = [arg.to(self._device) if hasattr(arg, 'to') else arg for arg in args]
+            for k, v in kwargs.items():
+                if hasattr(v, 'to'):
+                    kwargs[k] = v.to(self._device)
+            
+            # Gestion spéciale pour WanVAE qui nécessite un paramètre 'scale'
+            try:
+                result = self._inner_vae.decode(*args, **kwargs)
+            except TypeError as e:
+                if "missing 1 required positional argument: 'scale'" in str(e):
+                    print("WanVAE detected - adding scale parameter")
+                    
+                    # Pour WanVAE, utiliser le scale existant de l'objet parent (WanVAE wrapper)
+                    # qui contient les bonnes valeurs mean/std
+                    if 'scale' not in kwargs:
+                        # Chercher le scale dans l'objet parent WanVAE
+                        parent_vae = self._original_vae  # L'objet WanVAE complet
+                        if hasattr(parent_vae, 'scale'):
+                            # Utiliser le scale existant du WanVAE
+                            scale = parent_vae.scale
+                            # S'assurer que les tensors sont sur le bon device
+                            if isinstance(scale, list) and len(scale) == 2:
+                                scale_mean = scale[0].to(self._device) if hasattr(scale[0], 'to') else torch.tensor(scale[0], device=self._device)
+                                scale_std_inv = scale[1].to(self._device) if hasattr(scale[1], 'to') else torch.tensor(scale[1], device=self._device)
+                                kwargs['scale'] = [scale_mean, scale_std_inv]
+                            else:
+                                kwargs['scale'] = scale
+                        else:
+                            # Fallback: utiliser les valeurs par défaut de WanVAE (z_dim=16)
+                            mean = torch.tensor([
+                                -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+                                0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
+                            ], device=self._device)
+                            
+                            std = torch.tensor([
+                                2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+                                3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
+                            ], device=self._device)
+                            
+                            std_inv = 1.0 / std
+                            kwargs['scale'] = [mean, std_inv]
+                    
+                    result = self._inner_vae.decode(*args, **kwargs)
+                else:
+                    # Re-raise l'erreur si ce n'est pas le problème de scale
+                    raise e
+            
+            self._offload_if_needed()
+            return result
+        
+        def to(self, device):
+            """Handle device placement calls - ne fait rien si offload est activé"""
+            if not self._cpu_offload:
+                self._inner_vae = self._inner_vae.to(device)
+            return self
+        
+        def __getattr__(self, name):
+            # Évite la récursion en utilisant object.__getattribute__ pour les attributs privés
+            if name.startswith('_'):
+                return object.__getattribute__(self, name)
+            # Forward all other attribute access to the inner VAE
+            return getattr(self._inner_vae, name)
+        
+        def __setattr__(self, name, value):
+            # Handle special wrapper attributes avec object.__setattr__
+            if name.startswith('_') or name in ['_original_vae', '_inner_vae', '_device', '_cpu_offload', '_has_nested_structure', '_is_on_gpu']:
+                object.__setattr__(self, name, value)
+            else:
+                # Forward attribute setting to inner VAE
+                setattr(self._inner_vae, name, value)
+
+    # FIX 3: Wrapper similaire pour le text encoder CORRIGÉ
+    class TextEncoderWrapper:
+        def __init__(self, text_encoder, device):
+            object.__setattr__(self, '_text_encoder', text_encoder)
+            object.__setattr__(self, '_device', device)
+            object.__setattr__(self, '_cpu_offload', args.sequential_cpu_offload)
+            object.__setattr__(self, '_is_on_gpu', False)
+            
+        def _ensure_on_device(self, target_device):
+            """Assure que le text encoder est sur le bon device avec gestion mémoire"""
+            if not self._cpu_offload:
+                return
+                
+            current_device = next(self._text_encoder.parameters()).device
+            if str(current_device) != str(target_device):
+                try:
+                    self._text_encoder = self._text_encoder.to(target_device)
+                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+                except torch.cuda.OutOfMemoryError:
+                    # Nettoie la mémoire et réessaie
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    self._text_encoder = self._text_encoder.to(target_device)
+                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+            
+        def _offload_if_needed(self):
+            """Remet sur CPU si l'offload est activé"""
+            if self._cpu_offload and self._is_on_gpu:
+                self._text_encoder = self._text_encoder.to("cpu")
+                object.__setattr__(self, '_is_on_gpu', False)
+                torch.cuda.empty_cache()
+            
+        def __call__(self, *args, **kwargs):
+            self._ensure_on_device(self._device)
+            
+            # S'assurer que tous les inputs sont sur le bon device
+            args = [arg.to(self._device) if hasattr(arg, 'to') else arg for arg in args]
+            for k, v in kwargs.items():
+                if hasattr(v, 'to'):
+                    kwargs[k] = v.to(self._device)
+            
+            result = self._text_encoder(*args, **kwargs)
+            self._offload_if_needed()
+            return result
+        
+        def to(self, device):
+            """Handle device placement calls - avec gestion d'offload"""
+            if self._cpu_offload:
+                # Si l'offload est activé, on ne fait rien ici
+                # Le déplacement se fera dynamiquement lors de l'utilisation
+                print(f"TextEncoder.to({device}) intercepted - using dynamic offload instead")
+                return self
+            else:
+                # Mode normal
+                try:
+                    self._text_encoder = self._text_encoder.to(device)
+                except torch.cuda.OutOfMemoryError:
+                    print(f"OOM during TextEncoder.to({device}) - trying with memory cleanup")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    self._text_encoder = self._text_encoder.to(device)
+                return self
+        
+        def __getattr__(self, name):
+            # Évite la récursion pour les attributs privés
+            if name.startswith('_'):
+                return object.__getattribute__(self, name)
+            # Forward all other attribute access to the wrapped text encoder
+            return getattr(self._text_encoder, name)
+        
+        def __setattr__(self, name, value):
+            # Handle special wrapper attributes
+            if name.startswith('_') or name in ['_text_encoder', '_device', '_cpu_offload', '_is_on_gpu']:
+                object.__setattr__(self, name, value)
+            else:
+                # Forward attribute setting to wrapped text encoder
+                setattr(self._text_encoder, name, value)
+
+    # Wrapping des composants avec gestion des devices
+    if hasattr(pipe, 'vae'):
+        print("Wrapping VAE with device management...")
+        pipe.vae = VAEWrapper(pipe.vae, current_device)
+    
+    if hasattr(pipe, 'text_encoder'):
+        print("Wrapping Text Encoder with device management...")
+        pipe.text_encoder = TextEncoderWrapper(pipe.text_encoder, current_device)
+
+    # Optimisations mémoire avec device management
     if args.sequential_cpu_offload:
-        # Offload séquentiel des composants
+        # Déplace les composants sur CPU, mais garde les wrappers
+        print("Moving components to CPU for sequential offload...")
         if hasattr(pipe, 'vae'):
-            pipe.vae = pipe.vae.to("cpu")
-        if hasattr(pipe, 'unet'):
-            pipe.unet = pipe.unet.to("cpu")
+            try:
+                pipe.vae._inner_vae = pipe.vae._inner_vae.to("cpu")
+                print("VAE moved to CPU")
+            except Exception as e:
+                print(f"Warning: Could not move VAE to CPU: {e}")
+        if hasattr(pipe, 'text_encoder'):
+            try:
+                pipe.text_encoder._text_encoder = pipe.text_encoder._text_encoder.to("cpu")
+                print("Text Encoder moved to CPU")
+            except Exception as e:
+                print(f"Warning: Could not move Text Encoder to CPU: {e}")
+        
+        # Nettoie la mémoire GPU après avoir déplacé les composants
+        gc.collect()
+        torch.cuda.empty_cache()
         print("Sequential CPU offload enabled")
 
     if args.gradient_checkpointing:
@@ -184,12 +420,10 @@ if __name__ == "__main__":
                 pipe.transformer.enable_gradient_checkpointing()
                 print("Gradient checkpointing enabled")
             elif hasattr(pipe.transformer, '_set_gradient_checkpointing'):
-                # Pour WanModel, essaie la méthode directe
                 pipe.transformer._set_gradient_checkpointing(True)
                 print("Gradient checkpointing enabled (WanModel)")
         except Exception as e:
             print(f"Gradient checkpointing not supported: {e}")
-            print("Continuing without gradient checkpointing")
 
     # Configuration DeepSpeed pour l'offload
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -204,11 +438,11 @@ if __name__ == "__main__":
     }
 
     if args.cpu_offload_aggressive:
-        # Configuration plus aggressive pour l'offload
         zero_config["offload_param"]["pin_memory"] = True
         print("Aggressive CPU offload enabled")
 
     # Wrapping the transformer with DeepSpeed Inference Engine
+    print("Initializing DeepSpeed inference engine...")
     engine = deepspeed.init_inference(
         pipe.transformer,
         tensor_parallel={"tp_size": world_size},
@@ -224,6 +458,7 @@ if __name__ == "__main__":
 
     # Teacache (optionnel)
     if args.teacache:
+        print("using teacache")
         engine.module.initialize_teacache(
             enable_teacache=True,
             num_steps=args.inference_steps,
@@ -231,20 +466,6 @@ if __name__ == "__main__":
             use_ret_steps=args.use_ret_steps,
             ckpt_dir=args.model_id,
         )
-
-    # Fonction pour déplacer les tenseurs sur GPU temporairement
-    def move_to_gpu_temporarily(model, device):
-        """Déplace le modèle sur GPU temporairement pour l'inférence"""
-        if hasattr(model, 'to'):
-            return model.to(device)
-        return model
-
-    def move_to_cpu_after_use(model):
-        """Remet le modèle sur CPU après utilisation"""
-        if hasattr(model, 'to'):
-            model.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
 
     # Prépare les kwargs pour l'inférence
     kwargs = {
@@ -254,7 +475,7 @@ if __name__ == "__main__":
         "num_inference_steps": args.inference_steps,
         "guidance_scale": args.guidance_scale,
         "shift": args.shift,
-        "generator": torch.Generator(device="cuda").manual_seed(args.seed),
+        "generator": torch.Generator(device=current_device).manual_seed(args.seed),
         "height": height,
         "width": width,
     }
@@ -276,11 +497,21 @@ if __name__ == "__main__":
 
     # Lancement de l'inférence avec gestion mémoire optimisée
     try:
-        with torch.cuda.amp.autocast(dtype=torch.float16), torch.no_grad():
-            # Nettoyage préventif
-            gc.collect()
-            torch.cuda.empty_cache()
-            
+        # Nettoyage préventif maximal avant inférence
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Réduction préventive des paramètres si mémoire critique
+        if torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() > 0.85:
+            print("Critical memory usage detected - reducing parameters preemptively")
+            if args.num_frames > 25:
+                kwargs["num_frames"] = 25
+                print(f"Reduced num_frames to {kwargs['num_frames']}")
+            if args.inference_steps > 15:
+                kwargs["num_inference_steps"] = 15
+                print(f"Reduced inference_steps to {kwargs['num_inference_steps']}")
+        
+        with torch.amp.autocast('cuda', dtype=torch.float16), torch.no_grad():
             print("Starting inference...")
             video_frames = pipe(**kwargs)[0]
             
@@ -291,23 +522,37 @@ if __name__ == "__main__":
         print(f"CUDA OOM Error: {e}")
         print("Trying with more aggressive memory management...")
         
-        # Nettoyage complet
+        # Nettoyage complet et plus agressif
         gc.collect()
         torch.cuda.empty_cache()
         
-        # Réduit la taille des frames si nécessaire
-        if args.num_frames > 49:
-            print("Reducing num_frames to 49 for memory efficiency")
-            kwargs["num_frames"] = 49
+        # Force le déplacement de tous les composants sur CPU temporairement
+        if hasattr(pipe, 'vae') and hasattr(pipe.vae, '_inner_vae'):
+            pipe.vae._inner_vae = pipe.vae._inner_vae.to("cpu")
+        if hasattr(pipe, 'text_encoder') and hasattr(pipe.text_encoder, '_text_encoder'):
+            pipe.text_encoder._text_encoder = pipe.text_encoder._text_encoder.to("cpu")
+        
+        # Nettoyage après déplacement
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Réduction drastique des paramètres
+        kwargs["num_frames"] = min(kwargs["num_frames"], 16)
+        kwargs["num_inference_steps"] = min(kwargs["num_inference_steps"], 10)
+        print(f"Emergency mode: num_frames={kwargs['num_frames']}, inference_steps={kwargs['num_inference_steps']}")
+        
+        # Retry avec paramètres ultra-conservateurs
+        try:
+            with torch.amp.autocast('cuda', dtype=torch.float16), torch.no_grad():
+                video_frames = pipe(**kwargs)[0]
+        except torch.cuda.OutOfMemoryError:
+            # Dernière tentative avec paramètres minimaux
+            kwargs["num_frames"] = 8
+            kwargs["num_inference_steps"] = 5
+            print(f"Final attempt: num_frames={kwargs['num_frames']}, inference_steps={kwargs['num_inference_steps']}")
             
-        # Réduit les steps d'inférence
-        if args.inference_steps > 20:
-            print("Reducing inference_steps to 20 for memory efficiency")
-            kwargs["num_inference_steps"] = 20
-            
-        # Retry avec paramètres réduits
-        with torch.cuda.amp.autocast(dtype=torch.float16), torch.no_grad():
-            video_frames = pipe(**kwargs)[0]
+            with torch.amp.autocast('cuda', dtype=torch.float16), torch.no_grad():
+                video_frames = pipe(**kwargs)[0]
 
     # Sauvegarde sur le master
     if local_rank == 0:
