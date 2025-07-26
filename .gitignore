@@ -1,6 +1,6 @@
 __pycache__/
-checkpoint/*
-checkpoint
+checkpoints/*
+checkpoints
 results/*
 .DS_Store
 results/*
