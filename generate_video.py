@@ -58,6 +58,16 @@ if __name__ == "__main__":
         "--use_ret_steps",
         action="store_true",
         help="Using Retention Steps will result in faster generation speed and better generation quality.")
+    parser.add_argument(
+        "--use_fp8",
+        action="store_true",
+        help="Enable FP8 quantization to reduce memory usage and accelerate inference on RTX 4090/5090 GPUs.")
+    parser.add_argument(
+        "--fp8_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "native", "transformer_engine", "fallback"],
+        help="Backend to use for FP8 quantization (auto will select the best available).")
     args = parser.parse_args()
 
     args.model_id = download_model(args.model_id)
@@ -111,14 +121,20 @@ if __name__ == "__main__":
     if image is None:
         assert "T2V" in args.model_id, f"check model_id:{args.model_id}"
         print("init text2video pipeline")
+        if args.use_fp8:
+            print(f"FP8 quantization enabled with backend: {args.fp8_backend}")
         pipe = Text2VideoPipeline(
-            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload
+            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload,
+            use_fp8=args.use_fp8, fp8_backend=args.fp8_backend
         )
     else:
         assert "I2V" in args.model_id, f"check model_id:{args.model_id}"
         print("init img2video pipeline")
+        if args.use_fp8:
+            print(f"FP8 quantization enabled with backend: {args.fp8_backend}")
         pipe = Image2VideoPipeline(
-            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload
+            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload,
+            use_fp8=args.use_fp8, fp8_backend=args.fp8_backend
         )
         args.image = load_image(args.image)
         image_width, image_height = args.image.size

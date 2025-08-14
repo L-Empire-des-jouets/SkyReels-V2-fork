@@ -37,10 +37,10 @@ def resizecrop(image: Image.Image, th, tw):
 
 class Image2VideoPipeline:
     def __init__(
-        self, model_path, dit_path, device: str = "cuda", weight_dtype=torch.bfloat16, use_usp=False, offload=False
+        self, model_path, dit_path, device: str = "cuda", weight_dtype=torch.bfloat16, use_usp=False, offload=False, use_fp8=False, fp8_backend="auto"
     ):
         load_device = "cpu" if offload else device
-        self.transformer = get_transformer(dit_path, load_device, weight_dtype)
+        self.transformer = get_transformer(dit_path, load_device, weight_dtype, use_fp8=use_fp8, fp8_backend=fp8_backend)
         vae_model_path = os.path.join(model_path, "Wan2.1_VAE.pth")
         self.vae = get_vae(vae_model_path, device, weight_dtype=torch.float32)
         self.text_encoder = get_text_encoder(model_path, load_device, weight_dtype)
