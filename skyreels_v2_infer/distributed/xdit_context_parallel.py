@@ -231,7 +231,6 @@ def usp_dit_forward(self, x, t, context, clip_fea=None, y=None, fps=None):
 
 
 def usp_attn_forward(self, x, grid_sizes, freqs, block_mask):
-
     r"""
     Args:
         x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -258,18 +257,23 @@ def usp_attn_forward(self, x, grid_sizes, freqs, block_mask):
     if not self._flag_ar_attention:
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
+        
+        # FIX: S'assurer que tous les tenseurs ont le même dtype AVANT l'attention
+        target_dtype = torch.bfloat16 if q.dtype in half_dtypes else torch.float16
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+        
     else:
-
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
-        q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
-        v = v.to(torch.bfloat16)
-        # x = torch.nn.functional.scaled_dot_product_attention(
-        #     q.transpose(1, 2),
-        #     k.transpose(1, 2),
-        #     v.transpose(1, 2),
-        #    ).transpose(1, 2).contiguous()
+        
+        # FIX: S'assurer que tous les tenseurs ont le même dtype
+        target_dtype = torch.bfloat16
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+        
         with sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             x = (
                 torch.nn.functional.scaled_dot_product_attention(
@@ -278,7 +282,22 @@ def usp_attn_forward(self, x, grid_sizes, freqs, block_mask):
                 .transpose(1, 2)
                 .contiguous()
             )
-    x = xFuserLongContextAttention()(None, query=half(q), key=half(k), value=half(v), window_size=self.window_size)
+        # Retourner directement x si on utilise l'attention causale
+        x = x.flatten(2)
+        x = self.o(x)
+        return x
+
+    # FIX: Pour xFuserLongContextAttention, s'assurer que q, k, v ont le même dtype
+    # et utiliser la fonction half() de manière cohérente
+    q_half = half(q)
+    k_half = half(k) 
+    v_half = half(v)
+    
+    # Vérification finale des dtypes
+    assert q_half.dtype == k_half.dtype == v_half.dtype, \
+        f"Dtype mismatch: q={q_half.dtype}, k={k_half.dtype}, v={v_half.dtype}"
+    
+    x = xFuserLongContextAttention()(None, query=q_half, key=k_half, value=v_half, window_size=self.window_size)
 
     # output
     x = x.flatten(2)

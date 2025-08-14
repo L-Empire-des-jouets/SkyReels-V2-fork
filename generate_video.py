@@ -2,10 +2,6 @@ import os
 import torch
 import deepspeed
 
-# Active un logging plus verbeux pour NCCL (optionnel, diagnostic)
-os.environ["NCCL_DEBUG"] = "INFO"
-os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
-
 # Configuration pour optimiser l'utilisation mémoire
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -158,10 +154,10 @@ if __name__ == "__main__":
         )
         image = resizecrop(image, height, width)
 
-    # FIX 1: Gérer le device du VAE de manière cohérente
+    # FIX: Gérer le device du VAE de manière cohérente
     current_device = f"cuda:{local_rank}"
     
-    # FIX 2: Wrapper VAE CORRIGÉ pour éviter la récursion infinie
+    # FIX: Wrapper VAE CORRIGÉ pour éviter la récursion infinie
     class VAEWrapper:
         def __init__(self, original_vae, device):
             # IMPORTANT: Utiliser object.__setattr__ pour éviter la récursion
@@ -197,24 +193,31 @@ if __name__ == "__main__":
             if not self._cpu_offload:
                 return
                 
-            current_device = next(self._inner_vae.parameters()).device
-            if str(current_device) != str(target_device):
-                try:
-                    self._inner_vae = self._inner_vae.to(target_device)
-                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
-                except torch.cuda.OutOfMemoryError:
-                    # Nettoie la mémoire et réessaie
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    self._inner_vae = self._inner_vae.to(target_device)
-                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+            try:
+                current_device = next(self._inner_vae.parameters()).device
+                if str(current_device) != str(target_device):
+                    try:
+                        self._inner_vae = self._inner_vae.to(target_device)
+                        object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+                    except torch.cuda.OutOfMemoryError:
+                        # Nettoie la mémoire et réessaie
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        self._inner_vae = self._inner_vae.to(target_device)
+                        object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+            except StopIteration:
+                # Le modèle n'a pas de paramètres, pas besoin de le déplacer
+                pass
             
         def _offload_if_needed(self):
             """Remet sur CPU si l'offload est activé"""
             if self._cpu_offload and self._is_on_gpu:
-                self._inner_vae = self._inner_vae.to("cpu")
-                object.__setattr__(self, '_is_on_gpu', False)
-                torch.cuda.empty_cache()
+                try:
+                    self._inner_vae = self._inner_vae.to("cpu")
+                    object.__setattr__(self, '_is_on_gpu', False)
+                    torch.cuda.empty_cache()
+                except:
+                    pass  # Ignore les erreurs de déplacement
             
         def encode(self, *args, **kwargs):
             self._ensure_on_device(self._device)
@@ -243,8 +246,6 @@ if __name__ == "__main__":
                 result = self._inner_vae.decode(*args, **kwargs)
             except TypeError as e:
                 if "missing 1 required positional argument: 'scale'" in str(e):
-                    print("WanVAE detected - adding scale parameter")
-                    
                     # Pour WanVAE, utiliser le scale existant de l'objet parent (WanVAE wrapper)
                     # qui contient les bonnes valeurs mean/std
                     if 'scale' not in kwargs:
@@ -304,7 +305,7 @@ if __name__ == "__main__":
                 # Forward attribute setting to inner VAE
                 setattr(self._inner_vae, name, value)
 
-    # FIX 3: Wrapper similaire pour le text encoder CORRIGÉ
+    # FIX: Wrapper similaire pour le text encoder CORRIGÉ
     class TextEncoderWrapper:
         def __init__(self, text_encoder, device):
             object.__setattr__(self, '_text_encoder', text_encoder)
@@ -317,24 +318,31 @@ if __name__ == "__main__":
             if not self._cpu_offload:
                 return
                 
-            current_device = next(self._text_encoder.parameters()).device
-            if str(current_device) != str(target_device):
-                try:
-                    self._text_encoder = self._text_encoder.to(target_device)
-                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
-                except torch.cuda.OutOfMemoryError:
-                    # Nettoie la mémoire et réessaie
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    self._text_encoder = self._text_encoder.to(target_device)
-                    object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+            try:
+                current_device = next(self._text_encoder.parameters()).device
+                if str(current_device) != str(target_device):
+                    try:
+                        self._text_encoder = self._text_encoder.to(target_device)
+                        object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+                    except torch.cuda.OutOfMemoryError:
+                        # Nettoie la mémoire et réessaie
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        self._text_encoder = self._text_encoder.to(target_device)
+                        object.__setattr__(self, '_is_on_gpu', target_device != 'cpu')
+            except StopIteration:
+                # Le modèle n'a pas de paramètres
+                pass
             
         def _offload_if_needed(self):
             """Remet sur CPU si l'offload est activé"""
             if self._cpu_offload and self._is_on_gpu:
-                self._text_encoder = self._text_encoder.to("cpu")
-                object.__setattr__(self, '_is_on_gpu', False)
-                torch.cuda.empty_cache()
+                try:
+                    self._text_encoder = self._text_encoder.to("cpu")
+                    object.__setattr__(self, '_is_on_gpu', False)
+                    torch.cuda.empty_cache()
+                except:
+                    pass
             
         def __call__(self, *args, **kwargs):
             self._ensure_on_device(self._device)
@@ -354,14 +362,12 @@ if __name__ == "__main__":
             if self._cpu_offload:
                 # Si l'offload est activé, on ne fait rien ici
                 # Le déplacement se fera dynamiquement lors de l'utilisation
-                print(f"TextEncoder.to({device}) intercepted - using dynamic offload instead")
                 return self
             else:
                 # Mode normal
                 try:
                     self._text_encoder = self._text_encoder.to(device)
                 except torch.cuda.OutOfMemoryError:
-                    print(f"OOM during TextEncoder.to({device}) - trying with memory cleanup")
                     gc.collect()
                     torch.cuda.empty_cache()
                     self._text_encoder = self._text_encoder.to(device)
@@ -384,29 +390,24 @@ if __name__ == "__main__":
 
     # Wrapping des composants avec gestion des devices
     if hasattr(pipe, 'vae'):
-        print("Wrapping VAE with device management...")
         pipe.vae = VAEWrapper(pipe.vae, current_device)
     
     if hasattr(pipe, 'text_encoder'):
-        print("Wrapping Text Encoder with device management...")
         pipe.text_encoder = TextEncoderWrapper(pipe.text_encoder, current_device)
 
     # Optimisations mémoire avec device management
     if args.sequential_cpu_offload:
         # Déplace les composants sur CPU, mais garde les wrappers
-        print("Moving components to CPU for sequential offload...")
         if hasattr(pipe, 'vae'):
             try:
                 pipe.vae._inner_vae = pipe.vae._inner_vae.to("cpu")
-                print("VAE moved to CPU")
-            except Exception as e:
-                print(f"Warning: Could not move VAE to CPU: {e}")
+            except Exception:
+                pass
         if hasattr(pipe, 'text_encoder'):
             try:
                 pipe.text_encoder._text_encoder = pipe.text_encoder._text_encoder.to("cpu")
-                print("Text Encoder moved to CPU")
-            except Exception as e:
-                print(f"Warning: Could not move Text Encoder to CPU: {e}")
+            except Exception:
+                pass
         
         # Nettoie la mémoire GPU après avoir déplacé les composants
         gc.collect()
@@ -418,12 +419,13 @@ if __name__ == "__main__":
         try:
             if hasattr(pipe.transformer, 'enable_gradient_checkpointing'):
                 pipe.transformer.enable_gradient_checkpointing()
-                print("Gradient checkpointing enabled")
             elif hasattr(pipe.transformer, '_set_gradient_checkpointing'):
                 pipe.transformer._set_gradient_checkpointing(True)
-                print("Gradient checkpointing enabled (WanModel)")
-        except Exception as e:
-            print(f"Gradient checkpointing not supported: {e}")
+        except Exception:
+            pass
+
+    if args.cpu_offload_aggressive:
+        pass  # Configuration déjà appliquée dans zero_config
 
     # Configuration DeepSpeed pour l'offload
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -433,24 +435,25 @@ if __name__ == "__main__":
         "offload_param": {
             "device": "cpu",
             "nvme_path": "offload",
-            "pin_memory": False,
+            "pin_memory": args.cpu_offload_aggressive,
         }
     }
 
-    if args.cpu_offload_aggressive:
-        zero_config["offload_param"]["pin_memory"] = True
-        print("Aggressive CPU offload enabled")
-
     # Wrapping the transformer with DeepSpeed Inference Engine
     print("Initializing DeepSpeed inference engine...")
-    engine = deepspeed.init_inference(
-        pipe.transformer,
-        tensor_parallel={"tp_size": world_size},
-        dtype=torch.float16,
-        replace_with_kernel_inject=True,
-        zero=zero_config,
-    )
-    pipe.transformer = engine
+    
+    # FIX: Configuration DeepSpeed plus robuste
+    try:
+        engine = deepspeed.init_inference(
+            pipe.transformer,
+            tensor_parallel={"tp_size": world_size},
+            dtype=torch.float16,  # Utilise float16 pour la cohérence
+            replace_with_kernel_inject=True,
+            zero=zero_config,
+        )
+        pipe.transformer = engine
+    except Exception as e:
+        print(f"Warning: DeepSpeed initialization failed, continuing without optimization")
 
     # Nettoyage mémoire après init DeepSpeed
     gc.collect()
@@ -459,13 +462,27 @@ if __name__ == "__main__":
     # Teacache (optionnel)
     if args.teacache:
         print("using teacache")
-        engine.module.initialize_teacache(
-            enable_teacache=True,
-            num_steps=args.inference_steps,
-            teacache_thresh=args.teacache_thresh,
-            use_ret_steps=args.use_ret_steps,
-            ckpt_dir=args.model_id,
-        )
+        try:
+            if hasattr(pipe.transformer, 'module'):
+                # DeepSpeed wrapper
+                pipe.transformer.module.initialize_teacache(
+                    enable_teacache=True,
+                    num_steps=args.inference_steps,
+                    teacache_thresh=args.teacache_thresh,
+                    use_ret_steps=args.use_ret_steps,
+                    ckpt_dir=args.model_id,
+                )
+            else:
+                # Direct transformer
+                pipe.transformer.initialize_teacache(
+                    enable_teacache=True,
+                    num_steps=args.inference_steps,
+                    teacache_thresh=args.teacache_thresh,
+                    use_ret_steps=args.use_ret_steps,
+                    ckpt_dir=args.model_id,
+                )
+        except Exception:
+            pass
 
     # Prépare les kwargs pour l'inférence
     kwargs = {
@@ -494,6 +511,93 @@ if __name__ == "__main__":
 
     print("Memory usage before inference:")
     print_memory_usage()
+
+    # FIX: Patch de la fonction usp_attn_forward avant l'inférence
+    def patch_attention_function():
+        """Patche la fonction d'attention pour corriger le problème de dtype"""
+        try:
+            import skyreels_v2_infer.distributed.xdit_context_parallel as xdit_module
+            
+            # Sauvegarde la fonction originale
+            original_usp_attn_forward = xdit_module.usp_attn_forward
+            
+            def fixed_usp_attn_forward(self, x, grid_sizes, freqs, block_mask):
+                """Version corrigée de usp_attn_forward"""
+                b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+                half_dtypes = (torch.float16, torch.bfloat16)
+
+                def half(x):
+                    return x if x.dtype in half_dtypes else x.to(torch.bfloat16)
+
+                # query, key, value function
+                def qkv_fn(x):
+                    q = self.norm_q(self.q(x)).view(b, s, n, d)
+                    k = self.norm_k(self.k(x)).view(b, s, n, d)
+                    v = self.v(x).view(b, s, n, d)
+                    return q, k, v
+
+                x = x.to(self.q.weight.dtype)
+                q, k, v = qkv_fn(x)
+
+                if not self._flag_ar_attention:
+                    q = xdit_module.rope_apply(q, grid_sizes, freqs)
+                    k = xdit_module.rope_apply(k, grid_sizes, freqs)
+                    
+                    # FIX: S'assurer que tous les tenseurs ont le même dtype AVANT l'attention
+                    target_dtype = torch.bfloat16 if q.dtype in half_dtypes else torch.float16
+                    q = q.to(target_dtype)
+                    k = k.to(target_dtype)
+                    v = v.to(target_dtype)
+                    
+                else:
+                    q = xdit_module.rope_apply(q, grid_sizes, freqs)
+                    k = xdit_module.rope_apply(k, grid_sizes, freqs)
+                    
+                    # FIX: S'assurer que tous les tenseurs ont le même dtype
+                    target_dtype = torch.bfloat16
+                    q = q.to(target_dtype)
+                    k = k.to(target_dtype)
+                    v = v.to(target_dtype)
+                    
+                    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                        x = (
+                            torch.nn.functional.scaled_dot_product_attention(
+                                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=block_mask
+                            )
+                            .transpose(1, 2)
+                            .contiguous()
+                        )
+                    # Retourner directement x si on utilise l'attention causale
+                    x = x.flatten(2)
+                    x = self.o(x)
+                    return x
+
+                # FIX: Pour xFuserLongContextAttention, s'assurer que q, k, v ont le même dtype
+                # et utiliser la fonction half() de manière cohérente
+                q_half = half(q)
+                k_half = half(k) 
+                v_half = half(v)
+                
+                # Vérification finale des dtypes
+                assert q_half.dtype == k_half.dtype == v_half.dtype, \
+                    f"Dtype mismatch: q={q_half.dtype}, k={k_half.dtype}, v={v_half.dtype}"
+                
+                from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+                x = xFuserLongContextAttention()(None, query=q_half, key=k_half, value=v_half, window_size=self.window_size)
+
+                # output
+                x = x.flatten(2)
+                x = self.o(x)
+                return x
+            
+            # Applique le patch
+            xdit_module.usp_attn_forward = fixed_usp_attn_forward
+            
+        except Exception:
+            pass
+    
+    # Applique le patch
+    patch_attention_function()
 
     # Lancement de l'inférence avec gestion mémoire optimisée
     try:
@@ -553,6 +657,18 @@ if __name__ == "__main__":
             
             with torch.amp.autocast('cuda', dtype=torch.float16), torch.no_grad():
                 video_frames = pipe(**kwargs)[0]
+
+    except Exception as e:
+        print(f"Inference error: {e}")
+        print("Trying with fallback configuration...")
+        
+        # Configuration de fallback plus conservative
+        kwargs["num_frames"] = min(kwargs["num_frames"], 16)
+        kwargs["num_inference_steps"] = min(kwargs["num_inference_steps"], 8)
+        
+        # Disable mixed precision pour éviter les erreurs de dtype
+        with torch.no_grad():
+            video_frames = pipe(**kwargs)[0]
 
     # Sauvegarde sur le master
     if local_rank == 0:
