@@ -50,19 +50,43 @@ def apply_memory_optimizations(pipe):
     """Applique les optimisations mémoire du paper"""
     
     # 1. Gradient checkpointing style optimization
-    if hasattr(pipe.transformer, 'enable_gradient_checkpointing'):
-        pipe.transformer.enable_gradient_checkpointing()
-        print("✅ Gradient checkpointing activé")
+    try:
+        if hasattr(pipe.transformer, 'enable_gradient_checkpointing'):
+            # Essayer sans argument d'abord
+            try:
+                pipe.transformer.enable_gradient_checkpointing()
+                print("✅ Gradient checkpointing activé")
+            except TypeError:
+                # Si ça échoue, essayer avec la méthode _set_gradient_checkpointing
+                if hasattr(pipe.transformer, '_set_gradient_checkpointing'):
+                    pipe.transformer._set_gradient_checkpointing(True)
+                    print("✅ Gradient checkpointing activé (méthode alternative)")
+    except Exception as e:
+        print(f"⚠️ Gradient checkpointing non disponible: {e}")
     
     # 2. Activation offloading partiel
-    if hasattr(pipe, 'enable_cpu_offload'):
-        pipe.enable_cpu_offload()
-        print("✅ CPU offload activé")
+    try:
+        if hasattr(pipe, 'enable_model_cpu_offload'):
+            pipe.enable_model_cpu_offload()
+            print("✅ CPU offload activé")
+        elif hasattr(pipe, 'enable_cpu_offload'):
+            pipe.enable_cpu_offload()
+            print("✅ CPU offload activé")
+    except Exception as e:
+        print(f"⚠️ CPU offload non disponible: {e}")
     
     # 3. Memory efficient attention
-    if hasattr(pipe.transformer, 'set_use_memory_efficient_attention'):
-        pipe.transformer.set_use_memory_efficient_attention(True)
-        print("✅ Memory efficient attention activé")
+    try:
+        if hasattr(pipe.transformer, 'set_use_memory_efficient_attention'):
+            pipe.transformer.set_use_memory_efficient_attention(True)
+            print("✅ Memory efficient attention activé")
+        elif hasattr(pipe.transformer, 'set_attn_processor'):
+            # Alternative pour activer l'attention efficace
+            from diffusers.models.attention_processor import AttnProcessor2_0
+            pipe.transformer.set_attn_processor(AttnProcessor2_0())
+            print("✅ Attention processor 2.0 activé (memory efficient)")
+    except Exception as e:
+        print(f"⚠️ Memory efficient attention non disponible: {e}")
     
     return pipe
 
