@@ -18,3 +18,4 @@ scripts/.gradio/*
 out/*
 model/
 run.sh
+checkpoints/
