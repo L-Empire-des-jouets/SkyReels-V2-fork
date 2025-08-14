@@ -6,7 +6,10 @@ Implements the DiT transformer with FP8 quantization and SageAttention
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any
-from .transformer import WanModel, WanRMSNorm, WanBlock, WanSelfAttention
+from .transformer import (
+    WanModel, WanRMSNorm, WanAttentionBlock, 
+    WanSelfAttention, WanLayerNorm, WAN_CROSSATTENTION_CLASSES
+)
 from .fp8_quantization import FP8LinearQuantized, SageAttention8Bit, quantize_linear_layers
 
 
@@ -96,39 +99,79 @@ class WanSelfAttentionFP8(nn.Module):
         return attn_output
 
 
-class WanBlockFP8(nn.Module):
+class WanAttentionBlockFP8(nn.Module):
     """FP8 Quantized Transformer Block"""
     
-    def __init__(self, dim, num_heads=8, ffn_dim_multiplier=4, qkv_bias=False, rope_applied=False):
+    def __init__(
+        self,
+        cross_attn_type,
+        dim,
+        ffn_dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
+    ):
         super().__init__()
         self.dim = dim
+        self.ffn_dim = ffn_dim
         self.num_heads = num_heads
+        self.window_size = window_size
+        self.qk_norm = qk_norm
+        self.cross_attn_norm = cross_attn_norm
+        self.eps = eps
         
         # Layer normalization (keep in FP32 for stability)
-        self.norm1 = WanRMSNorm(dim)
-        self.norm2 = WanRMSNorm(dim)
+        self.norm1 = WanLayerNorm(dim, eps)
+        self.norm2 = WanLayerNorm(dim, eps)
+        self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         
         # FP8 Quantized Self-Attention
-        self.self_attn = WanSelfAttentionFP8(dim, num_heads, qkv_bias, rope_applied)
+        self.self_attn = WanSelfAttentionFP8(dim, num_heads, qkv_bias=False, rope_applied=False)
+        
+        # Cross attention (keep original for now, can be quantized later)
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps)
         
         # FP8 Quantized FFN
-        ffn_dim = int(dim * ffn_dim_multiplier)
         self.ffn = nn.Sequential(
             FP8LinearQuantized(dim, ffn_dim),
             nn.GELU(approximate="tanh"),
             FP8LinearQuantized(ffn_dim, dim)
         )
         
-    def forward(self, x, grid_sizes=None, freqs=None):
-        # Self-attention with residual
+        # modulation
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        
+    def forward(self, x, e, grid_sizes, freqs, context, block_mask):
+        # Keep the original forward logic but with FP8 components
+        if e.dim() == 3:
+            modulation = self.modulation
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                shift_sa, scale_sa, shift_ca, scale_ca, shift_ffn, scale_ffn = (
+                    e.unsqueeze(1) @ modulation
+                ).squeeze(1).chunk(6, dim=-1)
+        else:
+            shift_sa, scale_sa, shift_ca, scale_ca, shift_ffn, scale_ffn = e.chunk(6, dim=-1)
+        
+        # Self-attention with modulation
         residual = x
         x = self.norm1(x)
+        x = x * (1 + scale_sa) + shift_sa
         x = self.self_attn(x, grid_sizes, freqs)
         x = residual + x
         
-        # FFN with residual
+        # Cross-attention with modulation
+        residual = x
+        x = self.norm3(x)
+        x = x * (1 + scale_ca) + shift_ca
+        x = self.cross_attn(x, grid_sizes, freqs, context, block_mask)
+        x = residual + x
+        
+        # FFN with modulation
         residual = x
         x = self.norm2(x)
+        x = x * (1 + scale_ffn) + shift_ffn
         x = self.ffn(x)
         x = residual + x
         
@@ -155,12 +198,25 @@ class WanModelFP8(WanModel):
         # Replace transformer blocks with FP8 versions
         new_blocks = nn.ModuleList()
         for block in self.blocks:
-            fp8_block = WanBlockFP8(
+            # Get cross attention type
+            cross_attn_type = 't2v_cross_attn'  # Default
+            if hasattr(block, 'cross_attn'):
+                if hasattr(block.cross_attn, '__class__'):
+                    class_name = block.cross_attn.__class__.__name__
+                    if 'T2V' in class_name:
+                        cross_attn_type = 't2v_cross_attn'
+                    elif 'I2V' in class_name:
+                        cross_attn_type = 'i2v_cross_attn'
+            
+            fp8_block = WanAttentionBlockFP8(
+                cross_attn_type=cross_attn_type,
                 dim=block.dim,
-                num_heads=block.self_attn.num_heads if hasattr(block.self_attn, 'num_heads') else 8,
-                ffn_dim_multiplier=4,
-                qkv_bias=False,
-                rope_applied=block.self_attn.rope_applied if hasattr(block.self_attn, 'rope_applied') else False
+                ffn_dim=block.ffn_dim,
+                num_heads=block.num_heads,
+                window_size=block.window_size if hasattr(block, 'window_size') else (-1, -1),
+                qk_norm=block.qk_norm if hasattr(block, 'qk_norm') else True,
+                cross_attn_norm=block.cross_attn_norm if hasattr(block, 'cross_attn_norm') else False,
+                eps=block.eps if hasattr(block, 'eps') else 1e-6
             )
             
             # Copy weights from original block
@@ -208,7 +264,16 @@ class WanModelFP8(WanModel):
         
         # Copy normalization weights
         dst_block.norm1.weight.data = src_block.norm1.weight.data.clone()
+        if hasattr(src_block.norm1, 'bias') and src_block.norm1.bias is not None:
+            dst_block.norm1.bias.data = src_block.norm1.bias.data.clone()
+        
         dst_block.norm2.weight.data = src_block.norm2.weight.data.clone()
+        if hasattr(src_block.norm2, 'bias') and src_block.norm2.bias is not None:
+            dst_block.norm2.bias.data = src_block.norm2.bias.data.clone()
+        
+        # Copy modulation if exists
+        if hasattr(src_block, 'modulation'):
+            dst_block.modulation.data = src_block.modulation.data.clone()
     
     def _quantize_embeddings(self):
         """Quantize embedding layers to FP8"""
@@ -295,4 +360,4 @@ class WanModelFP8(WanModel):
 
 
 # Export the FP8 model
-__all__ = ['WanModelFP8', 'WanBlockFP8', 'WanSelfAttentionFP8']
+__all__ = ['WanModelFP8', 'WanAttentionBlockFP8', 'WanSelfAttentionFP8']
