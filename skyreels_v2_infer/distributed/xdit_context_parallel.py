@@ -18,15 +18,18 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@amp.autocast("cuda", enabled=False)
+@torch.amp.autocast("cuda", enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     """
     x:          [B, L, N, C].
     grid_sizes: [B, 3].
     freqs:      [M, C // 2].
     """
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
+    n, c = x.size(-2), x.size(-1) // 2
+    s = x.size(1)
+    assert c == freqs.size(-1), f"Mismatch between x dim {c} and freqs dim {freqs.size(-1)}"
+
+    # split freqs into temporal, height, and width dimensions
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     # loop over samples
@@ -35,8 +38,8 @@ def rope_apply(x, grid_sizes, freqs):
     for i, (f, h, w) in enumerate(grid):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
+        # precompute multipliers - use float32 instead of float64 to save memory
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float32).reshape(s, n, -1, 2))
         freqs_i = torch.cat(
             [
                 freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
