@@ -22,8 +22,8 @@ echo -e "${YELLOW}⚠️  Note: Ce mode utilise un seul GPU mais est plus stable
 
 # Paramètres
 MODEL_PATH="/home/server/dev/SkyReels-V2-fork/checkpoints/14B-T2V-540P"
-PROMPT="${1:-A serene lake surrounded by mountains}"
-MODE=${2:-safe}
+MODE=${1:-safe}
+PROMPT="${2:-A serene lake surrounded by mountains}"
 
 # Configuration selon le mode
 case $MODE in
