@@ -66,7 +66,8 @@ def rope_apply(x, grid_sizes, freqs):
 def broadcast_should_calc(should_calc: bool) -> bool:
     import torch.distributed as dist
 
-    device = torch.cuda.current_device()
+    # Ensure we use the correct device for the current rank
+    device = f'cuda:{dist.get_rank()}' if torch.cuda.is_available() else 'cpu'
     int_should_calc = 1 if should_calc else 0
     tensor = torch.tensor([int_should_calc], device=device, dtype=torch.int8)
     dist.broadcast(tensor, src=0)

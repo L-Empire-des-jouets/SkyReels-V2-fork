@@ -1,14 +1,38 @@
 # Guide d'optimisation SkyReels-V2 pour 2x RTX 5090
 
+## 🆕 MISE À JOUR : Correction de l'erreur NCCL
+
+Suite à l'erreur NCCL/CUDA, j'ai ajouté des corrections supplémentaires et des alternatives.
+
 ## 🚀 Solution rapide
 
-J'ai créé plusieurs optimisations pour résoudre votre problème de mémoire GPU :
+### Option 1 : GPU Unique (RECOMMANDÉ - Plus stable)
 
-### 1. Fichiers modifiés/créés
+```bash
+# Test simple sur un seul GPU
+python3 test_single_gpu.py
 
-- **`skyreels_v2_infer/distributed/xdit_context_parallel.py`** : Modifié pour utiliser float32 au lieu de float64 (économie ~50% de mémoire dans rope_apply)
-- **`generate_video_optimized.py`** : Script optimisé avec gestion mémoire améliorée
-- **`run_skyreels_2gpu.sh`** : Script de lancement avec différents modes
+# Ou utiliser le script de lancement
+./run_single_gpu.sh safe
+```
+
+### Option 2 : Multi-GPU avec USP (après corrections)
+
+```bash
+# Avec les corrections appliquées
+./run_skyreels_2gpu.sh safe
+```
+
+## 📝 Fichiers modifiés/créés
+
+### Corrections appliquées
+- **`skyreels_v2_infer/distributed/xdit_context_parallel.py`** : 
+  - Ligne 39 : float64 → float32 (économie mémoire)
+  - Ligne 69 : Correction du device pour broadcast NCCL
+- **`generate_video_optimized.py`** : Script optimisé avec gestion mémoire
+- **`test_single_gpu.py`** : Script de test GPU unique (nouveau)
+- **`run_single_gpu.sh`** : Lancement sur un seul GPU (nouveau)
+- **`run_skyreels_2gpu.sh`** : Script multi-GPU avec modes
 
 ### 2. Utilisation rapide
 
