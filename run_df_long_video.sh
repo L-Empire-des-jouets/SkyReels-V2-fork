@@ -25,7 +25,7 @@ echo -e "${MAGENTA}║            Modèle 1.3B optimisé pour la durée         
 echo -e "${MAGENTA}╚════════════════════════════════════════════════════════╝${NC}"
 
 # Paramètres
-MODEL_PATH="Skywork/SkyReels-V2-DF-1.3B-540P"
+MODEL_PATH="/home/server/dev/SkyReels-V2-fork/checkpoints/1.3B-540P"
 NUM_FRAMES=${1:-97}
 PROMPT="${2:-A cinematic journey through a futuristic city at night}"
 
