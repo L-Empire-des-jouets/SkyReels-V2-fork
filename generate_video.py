@@ -32,7 +32,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", type=str, default="video_out")
     parser.add_argument("--model_id", type=str, default="Skywork/SkyReels-V2-T2V-14B-540P")
-    parser.add_argument("--resolution", type=str, choices=["540P", "720P"])
+    parser.add_argument("--resolution", type=str, choices=["540P", "720P"], default=None,
+                        help="Video resolution. If not specified, will be auto-detected from model name.")
     parser.add_argument("--num_frames", type=int, default=97)
     parser.add_argument("--image", type=str, default=None)
     parser.add_argument("--guidance_scale", type=float, default=6.0)
@@ -58,6 +59,16 @@ if __name__ == "__main__":
         "--use_ret_steps",
         action="store_true",
         help="Using Retention Steps will result in faster generation speed and better generation quality.")
+    parser.add_argument(
+        "--use_fp8",
+        action="store_true",
+        help="Enable FP8 quantization to reduce memory usage and accelerate inference on RTX 4090/5090 GPUs.")
+    parser.add_argument(
+        "--fp8_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "native", "transformer_engine", "fallback"],
+        help="Backend to use for FP8 quantization (auto will select the best available).")
     args = parser.parse_args()
 
     args.model_id = download_model(args.model_id)
@@ -67,6 +78,19 @@ if __name__ == "__main__":
     if args.seed is None:
         random.seed(time.time())
         args.seed = int(random.randrange(4294967294))
+
+    # Auto-detect resolution from model name if not specified
+    if args.resolution is None:
+        if "720P" in args.model_id or "720p" in args.model_id:
+            args.resolution = "720P"
+            print(f"Auto-detected resolution: 720P from model name")
+        elif "540P" in args.model_id or "540p" in args.model_id:
+            args.resolution = "540P"
+            print(f"Auto-detected resolution: 540P from model name")
+        else:
+            # Default to 540P if can't detect from model name
+            args.resolution = "540P"
+            print(f"Using default resolution: 540P")
 
     if args.resolution == "540P":
         height = 544
@@ -111,14 +135,20 @@ if __name__ == "__main__":
     if image is None:
         assert "T2V" in args.model_id, f"check model_id:{args.model_id}"
         print("init text2video pipeline")
+        if args.use_fp8:
+            print(f"FP8 quantization enabled with backend: {args.fp8_backend}")
         pipe = Text2VideoPipeline(
-            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload
+            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload,
+            use_fp8=args.use_fp8, fp8_backend=args.fp8_backend
         )
     else:
         assert "I2V" in args.model_id, f"check model_id:{args.model_id}"
         print("init img2video pipeline")
+        if args.use_fp8:
+            print(f"FP8 quantization enabled with backend: {args.fp8_backend}")
         pipe = Image2VideoPipeline(
-            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload
+            model_path=args.model_id, dit_path=args.model_id, use_usp=args.use_usp, offload=args.offload,
+            use_fp8=args.use_fp8, fp8_backend=args.fp8_backend
         )
         args.image = load_image(args.image)
         image_width, image_height = args.image.size

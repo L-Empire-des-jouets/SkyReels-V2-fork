@@ -8,6 +8,13 @@ from .clip import CLIPModel
 from .t5 import T5EncoderModel
 from .transformer import WanModel
 from .vae import WanVAE
+from .fp8_quantization import (
+    enable_fp8_quantization,
+    quantize_model_to_fp8,
+    get_model_memory_usage,
+    FP8Linear,
+    FP8Attention,
+)
 
 
 def download_model(model_id):
@@ -27,7 +34,7 @@ def get_vae(model_path, device="cuda", weight_dtype=torch.float32) -> WanVAE:
     return vae
 
 
-def get_transformer(model_path, device="cuda", weight_dtype=torch.bfloat16) -> WanModel:
+def get_transformer(model_path, device="cuda", weight_dtype=torch.bfloat16, use_fp8=False, fp8_backend="auto") -> WanModel:
     config_path = os.path.join(model_path, "config.json")
     transformer = WanModel.from_config(config_path).to(weight_dtype).to(device)
 
@@ -39,6 +46,25 @@ def get_transformer(model_path, device="cuda", weight_dtype=torch.bfloat16) -> W
             del state_dict
             gc.collect()
             torch.cuda.empty_cache()
+
+    # Apply FP8 quantization if requested
+    if use_fp8:
+        print(f"Applying FP8 quantization to transformer model...")
+        enable_fp8_quantization(enabled=True, use_dynamic_scaling=True, backend=fp8_backend)
+        transformer = quantize_model_to_fp8(
+            transformer,
+            quantize_linear=True,
+            quantize_attention=True,
+            exclude_modules=['head', 'patch_embedding', 'text_embedding']
+        )
+        
+        # Print memory usage statistics
+        memory_stats = get_model_memory_usage(transformer)
+        print(f"Model memory usage after FP8 quantization:")
+        print(f"  Total parameters: {memory_stats['total_params']:,}")
+        print(f"  Total memory: {memory_stats['total_memory_mb']:.2f} MB")
+        print(f"  FP8 parameters: {memory_stats['fp8_params']:,}")
+        print(f"  BF16 parameters: {memory_stats['bf16_params']:,}")
 
     transformer.requires_grad_(False)
     transformer.eval()

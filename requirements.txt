@@ -11,3 +11,10 @@ dashscope
 imageio-ffmpeg
 numpy>=1.23.5,<2
 xfuser
+
+# Optional dependencies for FP8 quantization
+# Uncomment the following lines for FP8 support:
+# torch>=2.3.0  # For native FP8 support
+# transformer-engine  # For optimized FP8 on NVIDIA GPUs
+# psutil  # For memory monitoring
+# gputil  # For GPU monitoring
