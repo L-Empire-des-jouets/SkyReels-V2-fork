@@ -32,7 +32,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", type=str, default="video_out")
     parser.add_argument("--model_id", type=str, default="Skywork/SkyReels-V2-T2V-14B-540P")
-    parser.add_argument("--resolution", type=str, choices=["540P", "720P"])
+    parser.add_argument("--resolution", type=str, choices=["540P", "720P"], default=None,
+                        help="Video resolution. If not specified, will be auto-detected from model name.")
     parser.add_argument("--num_frames", type=int, default=97)
     parser.add_argument("--image", type=str, default=None)
     parser.add_argument("--guidance_scale", type=float, default=6.0)
@@ -77,6 +78,19 @@ if __name__ == "__main__":
     if args.seed is None:
         random.seed(time.time())
         args.seed = int(random.randrange(4294967294))
+
+    # Auto-detect resolution from model name if not specified
+    if args.resolution is None:
+        if "720P" in args.model_id or "720p" in args.model_id:
+            args.resolution = "720P"
+            print(f"Auto-detected resolution: 720P from model name")
+        elif "540P" in args.model_id or "540p" in args.model_id:
+            args.resolution = "540P"
+            print(f"Auto-detected resolution: 540P from model name")
+        else:
+            # Default to 540P if can't detect from model name
+            args.resolution = "540P"
+            print(f"Using default resolution: 540P")
 
     if args.resolution == "540P":
         height = 544
