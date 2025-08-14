@@ -214,26 +214,44 @@ def quantize_linear_layers(model: nn.Module, exclude_layers: Optional[list] = No
         The quantized model
     """
     exclude_layers = exclude_layers or []
+    quantized_count = 0
     
-    def replace_linear(module, name, child):
-        if isinstance(child, nn.Linear) and name not in exclude_layers:
-            # Don't quantize certain critical layers
-            if 'head' in name or 'embedding' in name:
-                return child
-            
-            # Replace with FP8 quantized version
-            fp8_layer = FP8LinearQuantized.from_linear(child)
-            setattr(module, name, fp8_layer)
-            return fp8_layer
-        return child
+    def should_quantize(name: str) -> bool:
+        """Check if a layer should be quantized"""
+        # Skip if in exclude list
+        if any(exc in name for exc in exclude_layers):
+            return False
+        # Skip critical layers
+        if 'head' in name.lower() or 'embedding' in name.lower():
+            return False
+        return True
     
-    # Recursively replace linear layers
-    for name, child in model.named_children():
-        if isinstance(child, nn.Linear):
-            replace_linear(model, name, child)
-        else:
-            quantize_linear_layers(child, exclude_layers)
+    # Get all linear layers with their full names
+    linear_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if should_quantize(name):
+                linear_layers.append((name, module))
     
+    print(f"Found {len(linear_layers)} linear layers to quantize")
+    
+    # Replace each linear layer with FP8 version
+    for name, linear_module in linear_layers:
+        # Navigate to the parent module
+        name_parts = name.split('.')
+        parent = model
+        for part in name_parts[:-1]:
+            parent = getattr(parent, part)
+        
+        # Get the attribute name
+        attr_name = name_parts[-1]
+        
+        # Create and set the FP8 layer
+        fp8_layer = FP8LinearQuantized.from_linear(linear_module)
+        setattr(parent, attr_name, fp8_layer)
+        quantized_count += 1
+    
+    print(f"Quantized {quantized_count} linear layers to FP8")
     return model
 
 
