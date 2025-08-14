@@ -90,6 +90,17 @@ def convert_model_to_fp8(model_path: str, output_path: str, device: str = "cuda"
     
     # Quantize linear layers
     print("Quantizing linear layers...")
+    print(f"Model has {sum(p.numel() for p in original_model.parameters())} total parameters")
+    
+    # List all linear layers first
+    linear_count = 0
+    for name, module in original_model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            linear_count += 1
+            print(f"  Found Linear layer: {name} - shape: {module.weight.shape}")
+    
+    print(f"Total linear layers found: {linear_count}")
+    
     quantized_model = quantize_linear_layers(
         original_model,
         exclude_layers=['head', 'embedding']  # Keep critical layers in higher precision
@@ -101,6 +112,8 @@ def convert_model_to_fp8(model_path: str, output_path: str, device: str = "cuda"
     
     print(f"\nMemory Statistics:")
     print(f"  Total Parameters: {memory_stats['total_params']:,}")
+    print(f"  FP8 Quantized Layers: {memory_stats.get('fp8_layers', 0)}")
+    print(f"  Regular Linear Layers: {memory_stats.get('regular_layers', 0)}")
     print(f"  Original Memory (FP32): {memory_stats['fp32_memory_gb']:.2f} GB")
     print(f"  Quantized Memory (FP8): {memory_stats['fp8_memory_gb']:.2f} GB")
     print(f"  Memory Reduction: {memory_stats['memory_reduction']*100:.1f}%")
@@ -183,25 +196,41 @@ def verify_quantized_model(model_path: str):
     print(f"\nVerifying quantized model at {model_path}...")
     
     try:
-        # Load the checkpoint
+        # Load the checkpoint with weights_only=False for compatibility
         checkpoint_path = os.path.join(model_path, "dit_checkpoint_fp8.pt")
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        
+        # Add safe globals for diffusers
+        import torch.serialization
+        from diffusers.configuration_utils import FrozenDict
+        torch.serialization.add_safe_globals([FrozenDict])
+        
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         
         print("✅ Checkpoint loaded successfully")
         print(f"  Quantization type: {checkpoint.get('quantization', 'unknown')}")
-        print(f"  Memory stats: {checkpoint.get('memory_stats', {})}")
+        
+        memory_stats = checkpoint.get('memory_stats', {})
+        print(f"  Memory stats:")
+        print(f"    Total params: {memory_stats.get('total_params', 0):,}")
+        print(f"    FP32 memory: {memory_stats.get('fp32_memory_gb', 0):.2f} GB")
+        print(f"    FP8 memory: {memory_stats.get('fp8_memory_gb', 0):.2f} GB")
+        print(f"    Reduction: {memory_stats.get('memory_reduction', 0)*100:.1f}%")
         
         # Try to instantiate the model (without loading weights to save memory)
         from skyreels_v2_infer.modules.transformer_fp8 import WanModelFP8
         
         config = checkpoint.get('config', {})
-        print(f"  Model config: {config}")
+        print(f"  Model type: {config.get('model_type', 'unknown')}")
+        print(f"  Dimensions: {config.get('dim', 0)}")
+        print(f"  Layers: {config.get('num_layers', 0)}")
         
         print("✅ Model verification successful!")
         return True
         
     except Exception as e:
         print(f"❌ Verification failed: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 

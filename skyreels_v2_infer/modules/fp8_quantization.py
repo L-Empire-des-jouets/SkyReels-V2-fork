@@ -265,26 +265,52 @@ def calculate_memory_savings(model: nn.Module) -> dict:
     total_params = 0
     fp32_memory = 0
     fp8_memory = 0
+    fp8_layers = 0
+    regular_layers = 0
     
+    # Count parameters and memory by module type
+    for name, module in model.named_modules():
+        if isinstance(module, FP8LinearQuantized):
+            # FP8 quantized layer
+            fp8_layers += 1
+            params = sum(p.numel() for p in module.parameters())
+            total_params += params
+            fp32_memory += params * 4  # Original would be FP32
+            fp8_memory += params * 1   # FP8 uses 1 byte
+            
+        elif isinstance(module, nn.Linear):
+            # Regular linear layer
+            regular_layers += 1
+            params = sum(p.numel() for p in module.parameters())
+            total_params += params
+            fp32_memory += params * 4
+            fp8_memory += params * 4  # Stays in FP32
+    
+    # Add non-linear parameters
     for name, param in model.named_parameters():
-        param_count = param.numel()
-        total_params += param_count
-        
-        # FP32 memory (4 bytes per parameter)
-        fp32_memory += param_count * 4
-        
-        # FP8 memory (1 byte per parameter for quantized layers)
-        if isinstance(param, FP8LinearQuantized):
-            fp8_memory += param_count * 1
-        else:
-            fp8_memory += param_count * 4  # Non-quantized layers stay in FP32
+        # Skip parameters already counted in linear layers
+        is_in_linear = any(
+            isinstance(module, (nn.Linear, FP8LinearQuantized)) and 
+            (param is module.weight or param is module.bias)
+            for _, module in model.named_modules()
+        )
+        if not is_in_linear:
+            param_count = param.numel()
+            total_params += param_count
+            fp32_memory += param_count * 4
+            fp8_memory += param_count * 4  # Non-linear params stay in FP32
+    
+    # Calculate actual savings
+    memory_reduction = 0 if fp32_memory == 0 else 1 - (fp8_memory / fp32_memory)
     
     return {
         'total_params': total_params,
+        'fp8_layers': fp8_layers,
+        'regular_layers': regular_layers,
         'fp32_memory_gb': fp32_memory / (1024**3),
         'fp8_memory_gb': fp8_memory / (1024**3),
-        'memory_reduction': 1 - (fp8_memory / fp32_memory),
-        'speedup_estimate': 1.1  # Conservative estimate based on paper
+        'memory_reduction': memory_reduction,
+        'speedup_estimate': 1.1 if fp8_layers > 0 else 1.0
     }
 
 
